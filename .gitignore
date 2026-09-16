@@ -1,0 +1,30 @@
+# Credenciales - NUNCA deben ir al repositorio
+aws_credentials.json
+aws_credentials.txt
+*credentials*.json
+*credentials*.txt
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Datos descargados y reportes generados por el pipeline (pesados / por ambiente)
+descargas/
+reportes/
+nuevos_r3_*.csv
+nuevos_items_R3.csv
+
+# Estado del historial del inventario (se regenera solo, pero OJO: si se
+# borra, la proxima corrida marca todo como "nuevo" otra vez porque pierde
+# la referencia de que ya existia).
+historial/
+
+# Nombres viejos (antes de reorganizar todo bajo descargas/) - por si queda
+# algo de una version anterior sin migrar
+nu0087001-aid-r2-ENV-dynamo-config-control/
+nu0600001-plataforma-ia-ENV-text-analyzer-table/
