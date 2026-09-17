@@ -92,13 +92,37 @@ def test_scan_state_dry_run_no_escribe_nada(tmp_path):
     assert not (tmp_path / "R3").exists()
 
 
-def test_scan_state_omite_items_ya_en_referencia(tmp_path):
+def test_scan_state_incremental_omite_items_ya_conocidos(tmp_path):
+    # Modo incremental (default, completo=False): rapido, no vuelve a
+    # escribir lo que ya se conocia. La "verdad completa" de cada ambiente
+    # ya no depende de esto -- vive en el maestro acumulado (maestro.py).
     existing = {"s3://bucket/udz/AAA"}
     state = _ScanState("config-control", tmp_path, tmp_path / "ref", "s3_path", existing, dry_run=False)
-    state.process_item({"s3_path": "s3://bucket/udz/AAA"})
+    state.process_item({"s3_path": "s3://bucket/udz/AAA"})  # ya conocido
+    state.process_item({"s3_path": "s3://bucket/udz/BBB"})  # nuevo
 
-    assert state.total_saved == 0
+    assert state.total_saved == 1  # solo BBB
+    assert state.total_existentes_referencia == 1  # AAA, contado pero no escrito
+    assert not (tmp_path / "R3" / "ms" / "AAA.json").exists()
+    assert (tmp_path / "R3" / "ms" / "BBB.json").exists()
+    assert len(state.report_lines) == 1
+    assert "BBB" in state.report_lines[0]
+
+
+def test_scan_state_completo_guarda_todo_incluso_lo_ya_conocido(tmp_path):
+    # Modo completo (completo=True, explicito): siempre guarda todo, sin
+    # importar la referencia. Es el modo a usar cuando se quiere una foto
+    # 100% confiable de la tabla en el momento (ej. para reconciliar el
+    # maestro y detectar eliminados de verdad).
+    existing = {"s3://bucket/udz/AAA"}
+    state = _ScanState("config-control", tmp_path, tmp_path / "ref", "s3_path", existing, dry_run=False, completo=True)
+    state.process_item({"s3_path": "s3://bucket/udz/AAA"})
+    state.process_item({"s3_path": "s3://bucket/udz/BBB"})
+
+    assert state.total_saved == 2
     assert state.total_existentes_referencia == 1
+    assert (tmp_path / "R3" / "ms" / "AAA.json").exists()
+    assert (tmp_path / "R3" / "ms" / "BBB.json").exists()
 
 
 def test_scan_state_serializa_decimales_de_dynamo(tmp_path):

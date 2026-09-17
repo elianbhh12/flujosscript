@@ -87,9 +87,18 @@ class _Args:
         self.__dict__.update(kwargs)
 
 
+def _menu_modo_descarga() -> str:
+    return _ask_choice(
+        "Descargar todo o solo lo nuevo?",
+        ["incremental (rapido, solo lo nuevo)", "completo (todo, mas lento)"],
+        default="incremental (rapido, solo lo nuevo)",
+    ).split(" ", 1)[0]
+
+
 def _menu_descargar() -> None:
     env = _ask_choice("Que ambiente?", list(config.ENVIRONMENTS), default="qa")
     tabla = _ask_choice("Que tabla?", [*config.TABLE_DEFS, "ambas", "todas"], default="ambas")
+    modo = _menu_modo_descarga()
     cred_file = _resolve_credenciales()
     if cred_file:
         load_credentials_file(Path(cred_file))
@@ -99,21 +108,26 @@ def _menu_descargar() -> None:
     tablas = ["config-control", "text-analyzer"] if tabla == "ambas" else (list(config.TABLE_DEFS) if tabla == "todas" else [tabla])
     from datetime import datetime
     today = datetime.now().strftime(config.DATE_FORMAT)
+    completo = modo == "completo"
 
     for t in tablas:
-        reference_dir = _find_default_reference_dir(t, env, today)
-        print(f"\nDescargando '{t}' ({env}). Referencia: {reference_dir or 'N/A (primera descarga)'}")
+        reference_dir = None if completo else _find_default_reference_dir(t, env, today)
+        print(f"\nDescargando '{t}' ({env}, modo {modo}). Referencia: {reference_dir or 'N/A'}")
         download.download(
             environment=env, table_key=t, reference_dir=reference_dir,
-            dry_run=dry_run,
+            dry_run=dry_run, completo=completo,
         )
 
 
 def _menu_run_all() -> None:
     env = _ask_choice("Que ambiente?", list(config.ENVIRONMENTS), default="qa")
+    modo = _menu_modo_descarga()
     cred_file = _resolve_credenciales()
 
-    args = _Args(env=env, perfil=None, segmentos=None, reintentos=download.DEFAULT_MAX_ATTEMPTS, credenciales_file=cred_file)
+    args = _Args(
+        env=env, perfil=None, segmentos=None, reintentos=download.DEFAULT_MAX_ATTEMPTS,
+        credenciales_file=cred_file, modo_descarga=modo,
+    )
     cmd_run_all(args)
 
 

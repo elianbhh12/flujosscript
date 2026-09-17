@@ -429,6 +429,28 @@ def build_events_workbook(out_path: Path, flows: list[dict]) -> Path:
     return out_path
 
 
+def build_maestro_workbook(out_path: Path, group_csv: Path, resumen: dict) -> Path:
+    """Excel GLOBAL y acumulado por ambiente (fuera de cualquier corrida
+    puntual): mismos campos y mismo formato visual que Reporte Agrupado,
+    pero construido a partir del maestro completo de historial.py en vez
+    de una sola descarga. group_csv ya viene armado con
+    group_report.write_grouped_csv() a partir de historial.flujos_presentes()."""
+    Workbook, *_rest = _get_openpyxl()
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    resumen_rows = [[str(k), "" if v is None else str(v)] for k, v in resumen.items()]
+    _write_rows_sheet(wb, "Resumen", ["Campo", "Valor"], resumen_rows)
+
+    _write_grouped_report_sheet(wb, group_csv)
+
+    wb.active = 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+    logger.info("Excel maestro generado: %s", out_path)
+    return out_path
+
+
 def build_historial_workbook(out_path: Path, eventos: list[dict]) -> Path:
     """Excel con el log completo y acumulado de historial.py (antes era
     un eventos.csv que crecia para siempre sin forma facil de revisarlo)."""

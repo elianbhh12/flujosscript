@@ -144,4 +144,11 @@ def test_snapshot_rows_para_historial(tmp_path):
 
     rows = group_report.snapshot_rows(r3_dir, detalle_csv, resultados_basenames={"AAA"})
 
-    assert rows == [{"file": "AAA.json", "subtipo": "carta", "ta_config": "ta1", "transmisiones": "Si"}]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["file"] == "AAA.json"
+    assert row["subtipo"] == "carta"
+    assert row["ta_config"] == "ta1"
+    assert row["transmisiones"] == "Si"
+    assert row["proceso"] == "SIN_PROCESO"
+    assert row["s3_path"] == "s3://x/AAA"

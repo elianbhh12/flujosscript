@@ -104,13 +104,17 @@ def cmd_descargar(args: argparse.Namespace) -> None:
         tablas = [args.tabla]
     today = datetime.now().strftime(config.DATE_FORMAT)
 
+    completo = args.modo_descarga == "completo"
     for tabla in tablas:
-        reference_dir = Path(args.referencia) if args.referencia else _find_default_reference_dir(tabla, args.env, today)
-        logger.info("Descargando %s (%s). Referencia: %s", tabla, args.env, reference_dir or "N/A (primera descarga)")
+        reference_dir = None if completo else (Path(args.referencia) if args.referencia else _find_default_reference_dir(tabla, args.env, today))
+        logger.info(
+            "Descargando %s (%s, modo %s). Referencia: %s",
+            tabla, args.env, args.modo_descarga, reference_dir or "N/A (primera descarga o modo completo)",
+        )
         download.download(
             environment=args.env, table_key=tabla, reference_dir=reference_dir,
             segments=args.segmentos, profile=args.perfil,
-            max_attempts=args.reintentos, dry_run=args.dry_run,
+            max_attempts=args.reintentos, dry_run=args.dry_run, completo=completo,
         )
 
 
@@ -159,18 +163,22 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     detalle_csv = compare_output_dir / "detalle_r3_vs_ta.csv"
     nuevos_r3_csv = report_root / "nuevos_vs_baseline.csv"
 
-    config_reference_dir = _find_default_reference_dir("config-control", environment, date_stamp)
-    ta_reference_dir = _find_default_reference_dir("text-analyzer", environment, date_stamp)
-    events_reference_dir = _find_default_reference_dir("events-manager", environment, date_stamp)
+    modo_descarga = getattr(args, "modo_descarga", "incremental")
+    completo = modo_descarga == "completo"
+    config_reference_dir = None if completo else _find_default_reference_dir("config-control", environment, date_stamp)
+    ta_reference_dir = None if completo else _find_default_reference_dir("text-analyzer", environment, date_stamp)
+    events_reference_dir = None if completo else _find_default_reference_dir("events-manager", environment, date_stamp)
 
     print()
-    print(f"=== Paso 1/7: descargando config-control, text-analyzer y events-manager ({environment}) ===")
-    if config_reference_dir or ta_reference_dir:
-        print("(descarga incremental: solo se trae lo nuevo desde la ultima descarga)")
+    print(f"=== Paso 1/7: descargando config-control, text-analyzer y events-manager ({environment}, modo {modo_descarga}) ===")
+    if not completo and (config_reference_dir or ta_reference_dir):
+        print("(descarga rapida: solo trae lo nuevo desde la ultima vez; el maestro global no depende de esto)")
+    elif completo:
+        print("(descarga completa: trae todo, mas lenta, pero necesaria para detectar eliminados de verdad)")
 
     try:
-        config_summary = download.download(environment, "config-control", config_reference_dir, args.segmentos, args.perfil, date_stamp, args.reintentos)
-        download.download(environment, "text-analyzer", ta_reference_dir, args.segmentos, args.perfil, date_stamp, args.reintentos)
+        config_summary = download.download(environment, "config-control", config_reference_dir, args.segmentos, args.perfil, date_stamp, args.reintentos, completo=completo)
+        download.download(environment, "text-analyzer", ta_reference_dir, args.segmentos, args.perfil, date_stamp, args.reintentos, completo=completo)
     except (CredentialsError, TableNotFoundError) as exc:
         logger.error(str(exc))
         sys.exit(1)
@@ -180,7 +188,7 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     # tumbar el resto del pipeline, solo esa columna queda vacia.
     resultados_basenames: Optional[set] = None
     try:
-        download.download(environment, "events-manager", events_reference_dir, args.segmentos, args.perfil, date_stamp, args.reintentos)
+        download.download(environment, "events-manager", events_reference_dir, args.segmentos, args.perfil, date_stamp, args.reintentos, completo=completo)
         resultados_basenames = events_analysis.resultados_basenames(
             config.download_dir("events-manager", environment, date_stamp)
         )
@@ -212,9 +220,9 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     total_r3, _suma, total_subtipos = group_report.generate(r3_dir, detalle_csv, group_out_csv, resultados_basenames)
 
     print()
-    print("=== Paso 5/7: actualizando historial del inventario ===")
+    print(f"=== Paso 5/7: actualizando el maestro global del ambiente (modo {modo_descarga}) ===")
     filas_actuales = group_report.snapshot_rows(r3_dir, detalle_csv, resultados_basenames)
-    historial_resumen = historial.actualizar(environment, filas_actuales)
+    historial_resumen = historial.actualizar(environment, filas_actuales, modo=modo_descarga)
     if any(historial_resumen.values()):
         print(
             f"  {len(historial_resumen['nuevos'])} nuevos, "
@@ -223,6 +231,8 @@ def cmd_run_all(args: argparse.Namespace) -> None:
         )
     else:
         print("  Sin cambios desde la ultima corrida.")
+    if not completo:
+        print("  (modo incremental: no se calculan eliminados -- corre 'completo' de vez en cuando para eso)")
 
     historial_path = config.REPORTES_DIR / f"historial_{environment}.xlsx"
     try:
@@ -230,6 +240,28 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     except RuntimeError as exc:
         logger.warning("No se genero el Excel de historial: %s", exc)
         historial_path = None
+
+    # Maestro global del ambiente: fuera de esta corrida, acumula TODO lo
+    # conocido (mismos campos que Reporte Agrupado), sin importar si hoy
+    # se descargo completo o solo lo nuevo.
+    maestro_path = config.REPORTES_DIR / f"maestro_{environment}.xlsx"
+    try:
+        flujos_maestro = historial.flujos_presentes(environment)
+        rows_maestro = group_report.group_rows(flujos_maestro)
+        maestro_csv = report_root / "_maestro_tmp.csv"
+        group_report.write_grouped_csv(rows_maestro, maestro_csv, incluir_transmisiones=True)
+        excel_report.build_maestro_workbook(
+            maestro_path, maestro_csv,
+            resumen={
+                "Ambiente": environment,
+                "Actualizado": run_tag,
+                "Total de flujos conocidos (presentes)": len(flujos_maestro),
+            },
+        )
+        maestro_csv.unlink(missing_ok=True)
+    except RuntimeError as exc:
+        logger.warning("No se genero el Excel maestro: %s", exc)
+        maestro_path = None
 
     matriz_data = matriz_ambientes.actualizar(environment, filas_actuales)
 
@@ -322,14 +354,19 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     if excel_path:
         print()
         print(f"  Reporte para revisar: {excel_path}")
+    if maestro_path:
+        print(f"  Maestro global del ambiente (acumulable): {maestro_path}")
     if matriz_path:
         print(f"  Matriz de ambientes (acumulable): {matriz_path}")
     if historial_path:
         print(f"  Historial completo (acumulable): {historial_path}")
     print("=" * 60)
 
-    if excel_path and not getattr(args, "no_abrir", False):
-        _abrir_excel(excel_path)
+    if not getattr(args, "no_abrir", False):
+        if excel_path:
+            _abrir_excel(excel_path)
+        if maestro_path:
+            _abrir_excel(maestro_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -347,6 +384,12 @@ def build_parser() -> argparse.ArgumentParser:
     common_aws.add_argument("--credenciales-file", default=None,
                              help="Archivo con credenciales AWS (JSON o texto con 'export AWS_...='), "
                                   "para no pegarlas a mano en la terminal. Ver aws_credentials.json de ejemplo.")
+    common_aws.add_argument(
+        "--modo-descarga", choices=["incremental", "completo"], default="incremental",
+        help="'incremental' (default): rapido, solo trae lo nuevo desde la ultima descarga. "
+             "'completo': trae todo, ignora la descarga anterior (mas lento, pero necesario de vez en "
+             "cuando para que el maestro pueda detectar flujos eliminados de verdad).",
+    )
 
     p_descargar = sub.add_parser("descargar", parents=[common_aws], help="Descarga una tabla DynamoDB.")
     p_descargar.add_argument(
@@ -355,7 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="'ambas' = config-control + text-analyzer (para el flujo de comparacion). 'todas' = las 3 tablas.",
     )
-    p_descargar.add_argument("--referencia", default=None, help="Carpeta de una descarga previa, para traer solo lo nuevo.")
+    p_descargar.add_argument("--referencia", default=None, help="Carpeta de una descarga previa, para marcar que es nuevo (ignorado si --modo-descarga completo).")
     p_descargar.add_argument("--dry-run", action="store_true", help="Escanea y clasifica pero no escribe nada a disco.")
     p_descargar.set_defaults(func=cmd_descargar)
 

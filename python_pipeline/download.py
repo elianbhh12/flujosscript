@@ -138,13 +138,21 @@ class _ScanState:
     ni corrompan los contadores."""
 
     def __init__(self, table_key: str, output_base_dir: Path, reference_dir: Optional[Path],
-                 reference_field: str, existing_keys: set, dry_run: bool):
+                 reference_field: str, existing_keys: set, dry_run: bool, completo: bool = False):
         self.table_key = table_key
         self.output_base_dir = output_base_dir
         self.reference_dir = reference_dir
         self.reference_field = reference_field
         self.existing_keys = existing_keys
         self.dry_run = dry_run
+        # completo=False (default): modo incremental, NO vuelve a escribir
+        # los items que ya estaban en la referencia (rapido, poco disco).
+        # La "verdad global" de cada ambiente no depende de esto -- vive en
+        # el maestro acumulado (ver maestro.py), que se actualiza con lo
+        # que se descargue cada vez, sea completo o no.
+        # completo=True: ignora la referencia para decidir que escribir,
+        # siempre guarda todo lo que hay en la tabla hoy.
+        self.completo = completo
 
         self.lock = threading.Lock()
         self.used_names: Dict[str, bool] = {}
@@ -164,10 +172,18 @@ class _ScanState:
             self.total_seen += 1
             flow_folder, safe_name = _classify_item(self.table_key, item, self.total_saved)
 
+            # En modo incremental (completo=False, default), un item ya
+            # conocido de la referencia NO se vuelve a escribir hoy -- eso
+            # es lo que hace rapida la descarga de todos los dias. La
+            # carpeta de hoy entonces solo representa "lo nuevo desde la
+            # ultima vez", no la tabla completa; por eso el reporte de esa
+            # corrida y el maestro acumulado (maestro.py) son cosas
+            # distintas: el maestro es el que sabe la verdad completa.
             reference_key = str(item.get(self.reference_field) or "")
             if self.reference_dir and reference_key and reference_key in self.existing_keys:
                 self.total_existentes_referencia += 1
-                return
+                if not self.completo:
+                    return
 
             output_dir = self.output_base_dir / flow_folder
             file_path = output_dir / f"{safe_name}.json"
@@ -193,8 +209,8 @@ class _ScanState:
             self.total_saved += 1
             self.counts_by_folder[flow_folder] = self.counts_by_folder.get(flow_folder, 0) + 1
 
-            if self.reference_dir:
-                self.report_lines.append(f"{flow_folder};{safe_name};{item.get('s3_path', '')};{file_path}")
+            if self.reference_dir and reference_key not in self.existing_keys:
+                self.report_lines.append(f"{flow_folder};{safe_name};{s3_path};{file_path}")
 
             if self.total_saved % PROGRESS_LOG_EVERY == 0:
                 logger.info("Progreso: %s items guardados hasta ahora...", self.total_saved)
@@ -288,6 +304,7 @@ def download(
     date_stamp: Optional[str] = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     dry_run: bool = False,
+    completo: bool = False,
 ) -> DownloadSummary:
     table_name = config.resolve_table_name(table_key, environment)
     date_stamp = date_stamp or date.today().strftime(config.DATE_FORMAT)
@@ -312,7 +329,7 @@ def download(
     if reference_dir:
         logger.info("Identificadores unicos en referencia (%s): %s", reference_field, len(existing_keys))
 
-    state = _ScanState(table_key, output_base_dir, reference_dir, reference_field, existing_keys, dry_run)
+    state = _ScanState(table_key, output_base_dir, reference_dir, reference_field, existing_keys, dry_run, completo)
     deserializer = _get_deserializer()
 
     if segments <= 1:
@@ -348,11 +365,19 @@ def download(
             reference_dir, item_count, summary,
         )
 
-    logger.info(
-        "Descarga finalizada%s. Guardados=%s, ya existian en referencia=%s",
-        " (DRY-RUN, nada se escribio a disco)" if dry_run else "",
-        summary.total_saved, summary.total_existentes_referencia,
-    )
+    if completo:
+        logger.info(
+            "Descarga completa finalizada%s. Total guardados hoy=%s (de esos, %s ya existian desde antes; %s son nuevos)",
+            " (DRY-RUN, nada se escribio a disco)" if dry_run else "",
+            summary.total_saved, summary.total_existentes_referencia,
+            summary.total_saved - summary.total_existentes_referencia,
+        )
+    else:
+        logger.info(
+            "Descarga incremental finalizada%s. Nuevos guardados hoy=%s. Ya conocidos (no se volvieron a escribir)=%s",
+            " (DRY-RUN, nada se escribio a disco)" if dry_run else "",
+            summary.total_saved, summary.total_existentes_referencia,
+        )
     for folder, count in summary.counts_by_folder.items():
         logger.info("  %s: %s", folder, count)
     if nombres_repetidos:
