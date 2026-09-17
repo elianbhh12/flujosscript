@@ -13,16 +13,13 @@ es una anomalia que vale la pena revisar.
 """
 from __future__ import annotations
 
-import csv
 import logging
 from pathlib import Path
 from typing import Dict
 
-from . import common
+from . import common, excel_report
 
 logger = logging.getLogger(__name__)
-
-HEADER = ["Flujo", "Tiene Crudos", "Tiene Transmisiones", "Observacion", "Archivo Crudos", "Archivo Transmisiones"]
 
 
 def analyze(events_dir: Path) -> list[dict]:
@@ -77,25 +74,12 @@ def resultados_basenames(events_dir: Path) -> set:
     return names
 
 
-def generate(events_dir: Path, out_csv: Path) -> dict:
+def generate(events_dir: Path, out_xlsx: Path) -> dict:
     if not events_dir.is_dir():
         raise FileNotFoundError(f"No existe el directorio de events-manager: {events_dir}")
 
     flows = analyze(events_dir)
-
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with out_csv.open("w", encoding="utf-8", newline="") as fh:
-        writer = csv.writer(fh, delimiter=";", lineterminator="\n")
-        writer.writerow(HEADER)
-        for flow in flows:
-            writer.writerow([
-                flow["flujo"],
-                "Si" if flow["tiene_crudos"] else "No",
-                "Si" if flow["tiene_transmisiones"] else "No",
-                flow["observacion"],
-                flow["archivo_crudos"],
-                flow["archivo_transmisiones"],
-            ])
+    excel_report.build_events_workbook(out_xlsx, flows)
 
     solo_crudos = sum(1 for f in flows if f["observacion"] == "Solo Crudos")
     ambos = sum(1 for f in flows if f["observacion"] == "Crudos + Transmisiones")
@@ -106,7 +90,7 @@ def generate(events_dir: Path, out_csv: Path) -> dict:
         "solo_crudos": solo_crudos,
         "crudos_y_transmisiones": ambos,
         "alertas_sin_crudos": alertas,
-        "out_csv": out_csv,
+        "out_xlsx": out_xlsx,
         "flows": flows,
     }
     logger.info(

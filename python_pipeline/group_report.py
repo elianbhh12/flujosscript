@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 _ORDER_INDEX = {name: i for i, name in enumerate(config.ORDEN_REPORTE_SUBTIPOS)}
 
+# Como quedan clasificados los R3 al descargarse (download.py los separa
+# en subcarpetas topics/ms segun si algun paso del flujo es tipo "topic").
+_TIPO_LABELS = {"topics": "R3 - Topics", "ms": "R3 - MS"}
+
 
 def _order_key(file_name: str) -> Tuple[int, int, str]:
     if file_name in _ORDER_INDEX:
@@ -38,10 +42,18 @@ def _load_detalle(detalle_csv: Path) -> List[dict]:
 def _load_r3_info(r3_dir: Path) -> Dict[str, dict]:
     info = {}
     for json_file, data in common.load_json_files(r3_dir):
+        # download.py guarda cada item en R3/topics o R3/ms segun su
+        # clasificacion; ese primer segmento de carpeta, relativo a r3_dir,
+        # es el "tipo" (se perdia apenas se armaba este reporte).
+        try:
+            tipo = json_file.relative_to(r3_dir).parts[0]
+        except (ValueError, IndexError):
+            tipo = ""
         info[json_file.name] = {
             "subtipo": common.get_tipo_documento(data),
             "proceso": common.get_proceso(data),
             "s3_path": str(data.get("s3_path") or ""),
+            "tipo": tipo,
         }
     return info
 
@@ -62,14 +74,31 @@ def _build_rows(r3_dir: Path, detalle_csv: Path, resultados_basenames: Optional[
         grupo["rows"].append({
             "file": file_name,
             "ta_config": (detalle_row.get("Nombre TA config") or "").strip(),
+            "tipo": _TIPO_LABELS.get(info.get("tipo", ""), info.get("tipo", "")),
             "proceso": info.get("proceso", ""),
             "s3_path": (detalle_row.get("Ruta JSON R3") or "").strip() or info.get("s3_path", ""),
             "observacion": (detalle_row.get("Observaciones") or "").strip(),
             "order_key": _order_key(file_name),
         })
 
+    # IMPORTANTE: hay que ordenar por GRUPO primero (no por archivo suelto),
+    # o filas del mismo subtipo pueden quedar no-contiguas cuando alguno de
+    # sus archivos no esta en la lista curada de ORDEN_REPORTE_SUBTIPOS (se
+    # ordena alfabeticamente por su cuenta, ignorando a que subtipo pertenece).
+    # Si eso pasa, el subtipo/cantidad que se "oculta" en las filas repetidas
+    # del grupo termina pareciendo el de otro grupo distinto en el Excel
+    # (fusion de celdas y subtipos que se ven trocados/cambiados de lugar).
+    for grupo in grupos.values():
+        grupo["rows"].sort(key=lambda r: (r["order_key"], common.normalize_text(r["file"])))
+        grupo["group_order_key"] = min(r["order_key"] for r in grupo["rows"])
+
+    grupos_ordenados = sorted(
+        grupos.items(),
+        key=lambda kv: (kv[1]["group_order_key"], common.normalize_text(kv[1]["subtipo"])),
+    )
+
     filas: List[dict] = []
-    for norm, grupo in grupos.items():
+    for norm, grupo in grupos_ordenados:
         for row in grupo["rows"]:
             row = dict(row)
             row["subtipo_grupo"] = grupo["subtipo"]
@@ -79,8 +108,26 @@ def _build_rows(r3_dir: Path, detalle_csv: Path, resultados_basenames: Optional[
                 row["transmisiones"] = "Si" if Path(row["file"]).stem in resultados_basenames else "No"
             filas.append(row)
 
-    filas.sort(key=lambda r: (r["order_key"], common.normalize_text(r["file"])))
     return filas, grupos
+
+
+def list_flat(directory: Path) -> List[dict]:
+    """Listado simple (sin agrupar por subtipo) de los JSON en una carpeta.
+    Para carpetas que no pasan por el flujo completo de comparacion contra
+    Text Analyzer (p.ej. R2), asi quedan visibles en el Excel en vez de
+    perderse silenciosamente."""
+    if not directory.is_dir():
+        return []
+    rows = [
+        {
+            "file": json_file.name,
+            "subtipo": common.get_tipo_documento(data),
+            "proceso": common.get_proceso(data),
+            "s3_path": str(data.get("s3_path") or ""),
+        }
+        for json_file, data in common.load_json_files(directory)
+    ]
+    return sorted(rows, key=lambda r: common.normalize_text(r["file"]))
 
 
 def snapshot_rows(r3_dir: Path, detalle_csv: Path, resultados_basenames: Optional[set] = None) -> List[dict]:
@@ -118,6 +165,7 @@ def generate(
                   "Cantidad de archivos con ese subtipo", "Proceso", "Ruta JSON R3", "Observaciones"]
         if incluir_transmisiones:
             header.append("Transmisiones")
+        header.append("Tipo")
         writer.writerow(header)
 
         for row in filas:
@@ -130,6 +178,7 @@ def generate(
             ]
             if incluir_transmisiones:
                 fila.append(row["transmisiones"])
+            fila.append(row["tipo"])
             writer.writerow(fila)
             grupos_impresos.add(row["norm_grupo"])
             total_r3 += 1
@@ -138,6 +187,7 @@ def generate(
         total_row = ["TOTAL_R3", "", "", total_r3, "", "", ""]
         if incluir_transmisiones:
             total_row.append("")
+        total_row.append("")
         writer.writerow(total_row)
 
     suma_grupos = sum(len(g["rows"]) for g in grupos.values())

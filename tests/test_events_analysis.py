@@ -1,6 +1,7 @@
-import csv
 import json
 from pathlib import Path
+
+from openpyxl import load_workbook
 
 from python_pipeline import common, events_analysis
 
@@ -63,20 +64,22 @@ def test_flujo_solo_transmisiones_es_alerta(tmp_path):
     assert flows[0]["observacion"].startswith("ALERTA")
 
 
-def test_generate_escribe_csv_y_resumen(tmp_path):
+def test_generate_escribe_excel_y_resumen(tmp_path):
     events_dir = tmp_path / "events"
     _write_json(events_dir / "crudos" / "A.json", {"s3_path": "s3://b/crudos/ns/A"})
     _write_json(events_dir / "crudos" / "B.json", {"s3_path": "s3://b/crudos/ns/B"})
     _write_json(events_dir / "resultados" / "B.json", {"s3_path": "s3://b/resultados/ns/B"})
 
-    out_csv = tmp_path / "out.csv"
-    summary = events_analysis.generate(events_dir, out_csv)
+    out_xlsx = tmp_path / "out.xlsx"
+    summary = events_analysis.generate(events_dir, out_xlsx)
 
     assert summary["total_flujos"] == 2
     assert summary["solo_crudos"] == 1
     assert summary["crudos_y_transmisiones"] == 1
     assert summary["alertas_sin_crudos"] == 0
 
-    rows = list(csv.reader(out_csv.open(encoding="utf-8"), delimiter=";"))
-    assert rows[0] == events_analysis.HEADER
+    assert out_xlsx.exists()
+    ws = load_workbook(out_xlsx)["Eventos UDZ"]
+    rows = list(ws.iter_rows(values_only=True))
+    assert rows[0] == ("Flujo", "Tiene Crudos", "Tiene Transmisiones", "Observacion", "Archivo Crudos", "Archivo Transmisiones")
     assert len(rows) == 3  # header + 2 flujos

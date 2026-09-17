@@ -160,8 +160,8 @@ def _menu_identificar_eventos() -> None:
         "Carpeta descargada de events-manager (UDZ)",
         default=str(events_default) if events_default else None,
     )
-    out_csv = _ask("CSV de salida", default="identificacion_eventos.csv")
-    events_analysis.generate(Path(events_dir), Path(out_csv))
+    out_xlsx = _ask("Excel de salida", default="identificacion_eventos.xlsx")
+    events_analysis.generate(Path(events_dir), Path(out_xlsx))
 
 
 _MENU_ACTIONS = {

@@ -241,6 +241,18 @@ def _historial_to_rows(historial_resumen: dict) -> list[list]:
     return rows
 
 
+def _nombres_repetidos_to_rows(nombres_repetidos: dict) -> list[list]:
+    rows = []
+    for nombre_base, items in sorted(nombres_repetidos.items(), key=lambda kv: -len(kv[1])):
+        for item in items:
+            rows.append([nombre_base, len(items), item["archivo"], item["s3_path"]])
+    return rows
+
+
+def _flat_rows_to_excel(rows: list[dict]) -> list[list]:
+    return [[r["file"], r["subtipo"], r["proceso"], r["s3_path"]] for r in rows]
+
+
 def build_workbook(
     out_path: Path,
     *,
@@ -251,6 +263,8 @@ def build_workbook(
     group_csv: Optional[Path] = None,
     nuevos_csv: Optional[Path] = None,
     historial_resumen: Optional[dict] = None,
+    nombres_repetidos: Optional[dict] = None,
+    r2_rows: Optional[list[dict]] = None,
 ) -> Path:
     Workbook, *_rest = _get_openpyxl()
     wb = Workbook()
@@ -263,6 +277,18 @@ def build_workbook(
         _write_grouped_report_sheet(wb, group_csv)
     if historial_resumen and any(historial_resumen.values()):
         _write_rows_sheet(wb, "Historial (vs corrida anterior)", ["Tipo de cambio", "Flujo"], _historial_to_rows(historial_resumen))
+    if nombres_repetidos:
+        _write_rows_sheet(
+            wb, "Nombres Repetidos",
+            ["Nombre base", "Cantidad", "Archivo guardado", "s3_path"],
+            _nombres_repetidos_to_rows(nombres_repetidos),
+        )
+    if r2_rows:
+        _write_rows_sheet(
+            wb, "R2 (raw)",
+            ["Nombre de los JSONs", "Subtipo", "Proceso", "Ruta S3"],
+            _flat_rows_to_excel(r2_rows),
+        )
     if classified_file:
         _write_csv_sheet(wb, "Comparacion - Clasificados", classified_file)
     if unclassified_file:
@@ -280,4 +306,141 @@ def build_workbook(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
     logger.info("Excel generado: %s", out_path)
+    return out_path
+
+
+def build_matriz_workbook(
+    out_path: Path,
+    data: dict,
+    environments: tuple = ("qa", "pdn", "dev"),
+) -> Path:
+    """Excel acumulable (independiente del reporte_completo.xlsx de cada
+    corrida): una fila por flujo, una columna por ambiente (Si / No / en
+    blanco si nunca se vio ahi), y una columna de alerta para el caso que
+    mas importa: flujos que ya estan en PDN pero no en QA."""
+    Workbook, Alignment, Border, Font, PatternFill, Side, get_column_letter = _get_openpyxl()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Matriz Ambientes"
+
+    header = ["Flujo"] + [env.upper() for env in environments] + ["Subtipo (mas reciente)", "Alerta"]
+    ws.append(header)
+
+    border = _thin_border()
+    band_fill = PatternFill(start_color=_BAND_FILL, end_color=_BAND_FILL, fill_type="solid")
+    alert_fill = PatternFill(start_color=_ALERT_FILL, end_color=_ALERT_FILL, fill_type="solid")
+    alert_font = Font(color=_ALERT_FONT_COLOR, bold=True)
+    center = Alignment(horizontal="center", vertical="center")
+
+    row_idx = 2
+    for flujo in sorted(data.keys(), key=lambda f: f.lower()):
+        ambientes = data[flujo]
+
+        estados = {}
+        for env in environments:
+            entry = ambientes.get(env)
+            if entry is None:
+                estados[env] = ""
+            else:
+                estados[env] = "Si" if entry.get("presente") else "No"
+
+        # El subtipo mas reciente entre los ambientes donde el flujo esta
+        # (o estuvo) presente, priorizando el que tenga fecha mas nueva.
+        con_info = [e for e in ambientes.values() if e.get("subtipo")]
+        subtipo = max(con_info, key=lambda e: e.get("ultima_vez", ""))["subtipo"] if con_info else ""
+
+        alerta = ""
+        if estados.get("pdn") == "Si" and estados.get("qa") in ("No", ""):
+            alerta = "EN PDN SIN QA"
+
+        fila = [flujo] + [estados[env] for env in environments] + [subtipo, alerta]
+        for col, value in enumerate(fila, start=1):
+            cell = ws.cell(row=row_idx, column=col, value=value)
+            cell.border = border
+            if row_idx % 2 == 0:
+                cell.fill = band_fill
+            if col > 1 and col <= 1 + len(environments):
+                cell.alignment = center
+
+        if alerta:
+            for col in range(1, len(fila) + 1):
+                ws.cell(row=row_idx, column=col).fill = alert_fill
+            ws.cell(row=row_idx, column=len(fila)).font = alert_font
+
+        row_idx += 1
+
+    n_cols = len(header)
+    _style_header(ws, n_cols)
+    if row_idx > 2:
+        ws.auto_filter.ref = f"A1:{get_column_letter(n_cols)}{row_idx - 1}"
+    _autofit_columns(ws, n_cols, row_idx - 1)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+    logger.info("Matriz de ambientes generada: %s (%s flujos)", out_path, len(data))
+    return out_path
+
+
+def build_events_workbook(out_path: Path, flows: list[dict]) -> Path:
+    """Excel de salida del comando 'identificar-eventos' (antes escribia un
+    .csv suelto). Alertas ('Solo Transmisiones, falta crudos') resaltadas."""
+    Workbook, Alignment, Border, Font, PatternFill, Side, get_column_letter = _get_openpyxl()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Eventos UDZ"
+
+    header = ["Flujo", "Tiene Crudos", "Tiene Transmisiones", "Observacion", "Archivo Crudos", "Archivo Transmisiones"]
+    ws.append(header)
+
+    border = _thin_border()
+    band_fill = PatternFill(start_color=_BAND_FILL, end_color=_BAND_FILL, fill_type="solid")
+    alert_fill = PatternFill(start_color=_ALERT_FILL, end_color=_ALERT_FILL, fill_type="solid")
+    alert_font = Font(color=_ALERT_FONT_COLOR, bold=True)
+
+    for row_idx, flow in enumerate(flows, start=2):
+        fila = [
+            flow["flujo"],
+            "Si" if flow["tiene_crudos"] else "No",
+            "Si" if flow["tiene_transmisiones"] else "No",
+            flow["observacion"],
+            flow["archivo_crudos"],
+            flow["archivo_transmisiones"],
+        ]
+        es_alerta = flow["observacion"].startswith("ALERTA")
+        for col, value in enumerate(fila, start=1):
+            cell = ws.cell(row=row_idx, column=col, value=value)
+            cell.border = border
+            if es_alerta:
+                cell.fill = alert_fill
+            elif row_idx % 2 == 0:
+                cell.fill = band_fill
+        if es_alerta:
+            ws.cell(row=row_idx, column=4).font = alert_font
+
+    n_rows = len(flows) + 1
+    _style_header(ws, len(header))
+    if len(flows) > 0:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(header))}{n_rows}"
+    _autofit_columns(ws, len(header), n_rows)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+    logger.info("Excel de eventos UDZ generado: %s (%s flujos)", out_path, len(flows))
+    return out_path
+
+
+def build_historial_workbook(out_path: Path, eventos: list[dict]) -> Path:
+    """Excel con el log completo y acumulado de historial.py (antes era
+    un eventos.csv que crecia para siempre sin forma facil de revisarlo)."""
+    Workbook, *_rest = _get_openpyxl()
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    header = ["Fecha", "Flujo", "Tipo de cambio", "Detalle"]
+    rows = [[ev["fecha"], ev["flujo"], ev["tipo"], ev["detalle"]] for ev in eventos]
+    _write_rows_sheet(wb, "Historial completo", header, rows)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+    logger.info("Excel de historial generado: %s (%s eventos)", out_path, len(eventos))
     return out_path

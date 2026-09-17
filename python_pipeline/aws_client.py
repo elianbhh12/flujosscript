@@ -13,6 +13,14 @@ de mas a menos comoda:
      (incluye AWS SSO: `aws sso login --profile x`, que se auto-renueva).
   3. Variables de entorno ya exportadas en la terminal (comportamiento
      original).
+
+Verificacion TLS: en la red del banco, la conexion a AWS pasa por un
+proxy/firewall que reemplaza el certificado y rompe la verificacion TLS
+normal de boto3 (mismo problema que ya se resolvio en el proyecto
+hermano banco/core/aws_upload.py). Por eso VERIFY_TLS esta en False por
+defecto -- si el dia de manana el banco instala su CA corporativa en el
+almacen de certificados de Python, se puede volver a poner en True aqui,
+en un solo lugar.
 """
 from __future__ import annotations
 
@@ -26,6 +34,8 @@ if TYPE_CHECKING:
     import boto3
 
 logger = logging.getLogger(__name__)
+
+VERIFY_TLS = False
 
 _CRED_VARS = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
 _LINE_RE = re.compile(r'^(?:export\s+)?(AWS_[A-Z_]+)\s*=\s*"?([^"\n]*)"?\s*$')
@@ -112,16 +122,21 @@ def _import_boto3():
     # verificar, agrupar, validar-nuevos) no requieren boto3 instalado.
     try:
         import boto3
-        from botocore.exceptions import ClientError, NoCredentialsError, ProfileNotFound
+        import urllib3
+        from botocore.exceptions import ClientError, EndpointConnectionError, NoCredentialsError, ProfileNotFound
     except ImportError as exc:
         raise CredentialsError(
             "Falta boto3. Instala dependencias con: pip install -r requirements.txt"
         ) from exc
-    return boto3, ClientError, NoCredentialsError, ProfileNotFound
+    if not VERIFY_TLS:
+        # Con verify=False, urllib3 avisa en cada llamada que la conexion
+        # no es segura; se silencia porque es intencional (ver docstring).
+        urllib3.disable_warnings()
+    return boto3, ClientError, EndpointConnectionError, NoCredentialsError, ProfileNotFound
 
 
 def build_session(profile: Optional[str] = None, region: str = "us-east-1") -> "boto3.Session":
-    boto3, _, _, ProfileNotFound = _import_boto3()
+    boto3, _, _, _, ProfileNotFound = _import_boto3()
     try:
         if profile:
             return boto3.Session(profile_name=profile, region_name=region)
@@ -136,15 +151,19 @@ def validate_credentials(session: "boto3.Session") -> dict:
     """Confirma que las credenciales actuales son validas y no expiraron,
     igual que hacia `aws sts get-caller-identity` en el bash original,
     pero con un mensaje de error mas util."""
-    _, ClientError, NoCredentialsError, _ = _import_boto3()
+    _, ClientError, EndpointConnectionError, NoCredentialsError, _ = _import_boto3()
     try:
-        sts = session.client("sts")
+        sts = session.client("sts", verify=VERIFY_TLS)
         identity = sts.get_caller_identity()
     except NoCredentialsError as exc:
         raise CredentialsError(
             "No hay credenciales de AWS disponibles. Exporta "
             "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN, "
             "o usa --perfil <nombre> con un perfil configurado (aws configure / aws sso login)."
+        ) from exc
+    except EndpointConnectionError as exc:
+        raise CredentialsError(
+            f"No se pudo conectar a AWS STS (¿estas en la red del banco?): {exc}"
         ) from exc
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")

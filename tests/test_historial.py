@@ -58,19 +58,18 @@ def test_sin_cambios_no_genera_eventos(tmp_path, monkeypatch):
     assert resumen == {"nuevos": [], "eliminados": [], "cambios": []}
 
 
-def test_eventos_csv_es_append_only(tmp_path, monkeypatch):
+def test_eventos_se_acumulan_entre_corridas(tmp_path, monkeypatch):
     monkeypatch.setattr(historial, "HISTORIAL_DIR", tmp_path)
 
     historial.actualizar("qa", [{"file": "AAA.json", "subtipo": "carta", "ta_config": "", "transmisiones": ""}], fecha="2026-09-15")
     historial.actualizar("qa", [{"file": "BBB.json", "subtipo": "otro", "ta_config": "", "transmisiones": ""}], fecha="2026-09-16")
 
-    eventos_file = tmp_path / "qa" / "eventos.csv"
-    lineas = eventos_file.read_text(encoding="utf-8").splitlines()
-    assert lineas[0] == "Fecha;Flujo;Tipo de cambio;Detalle"
+    eventos = historial.eventos_completos("qa")
+    tipos_por_flujo = [(ev["flujo"], ev["tipo"]) for ev in eventos]
     # AAA nuevo el 15, luego eliminado el 16 (ya no aparece), BBB nuevo el 16
-    assert any("AAA.json;NUEVO" in l for l in lineas)
-    assert any("AAA.json;ELIMINADO" in l for l in lineas)
-    assert any("BBB.json;NUEVO" in l for l in lineas)
+    assert ("AAA.json", "NUEVO") in tipos_por_flujo
+    assert ("AAA.json", "ELIMINADO") in tipos_por_flujo
+    assert ("BBB.json", "NUEVO") in tipos_por_flujo
 
 
 def test_ambientes_no_se_mezclan(tmp_path, monkeypatch):

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import shutil
 import sys
@@ -21,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from . import common, compare, config, download, events_analysis, group_report, historial, new_vs_baseline, verify_repeated
+from . import common, compare, config, download, events_analysis, excel_report, group_report, historial, matriz_ambientes, new_vs_baseline, verify_repeated
 from .aws_client import CredentialsError, load_credentials_file
 from .download import TableNotFoundError
 
@@ -45,6 +46,17 @@ def _configure_logging(verbose: bool) -> None:
         # eso no le sirve al usuario final, solo ensucia la pantalla.
         for noisy_logger in ("boto3", "botocore", "urllib3", "s3transfer"):
             logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+
+def _abrir_excel(path: Path) -> None:
+    """Abre el Excel con la aplicacion por defecto de Windows (normalmente
+    Excel) al terminar el pipeline, para no tener que ir a buscarlo."""
+    try:
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    except AttributeError:
+        logger.info("No se pudo abrir el Excel automaticamente en este sistema. Abrelo manualmente: %s", path)
+    except OSError as exc:
+        logger.warning("No se pudo abrir el Excel automaticamente (%s). Abrelo manualmente: %s", exc, path)
 
 
 _DATE_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -118,7 +130,7 @@ def cmd_agrupar(args: argparse.Namespace) -> None:
 
 
 def cmd_identificar_eventos(args: argparse.Namespace) -> None:
-    events_analysis.generate(Path(args.events_dir), Path(args.out_csv))
+    events_analysis.generate(Path(args.events_dir), Path(args.out_xlsx))
 
 
 def cmd_validar_nuevos(args: argparse.Namespace) -> None:
@@ -157,7 +169,7 @@ def cmd_run_all(args: argparse.Namespace) -> None:
         print("(descarga incremental: solo se trae lo nuevo desde la ultima descarga)")
 
     try:
-        download.download(environment, "config-control", config_reference_dir, args.segmentos, args.perfil, date_stamp, args.reintentos)
+        config_summary = download.download(environment, "config-control", config_reference_dir, args.segmentos, args.perfil, date_stamp, args.reintentos)
         download.download(environment, "text-analyzer", ta_reference_dir, args.segmentos, args.perfil, date_stamp, args.reintentos)
     except (CredentialsError, TableNotFoundError) as exc:
         logger.error(str(exc))
@@ -176,7 +188,9 @@ def cmd_run_all(args: argparse.Namespace) -> None:
         logger.warning("No se pudo descargar events-manager (%s); se omite la columna Transmisiones.", exc)
 
     r3_dir = config.download_dir("config-control", environment, date_stamp) / "R3"
+    r2_dir = config.download_dir("config-control", environment, date_stamp) / "R2"
     ta_dir = config.download_dir("text-analyzer", environment, date_stamp)
+    r2_rows = group_report.list_flat(r2_dir)
 
     if not r3_dir.is_dir():
         logger.warning("No hay flujos R3 en la descarga (%s); se omiten los pasos 2-7.", r3_dir)
@@ -210,6 +224,15 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     else:
         print("  Sin cambios desde la ultima corrida.")
 
+    historial_path = config.REPORTES_DIR / f"historial_{environment}.xlsx"
+    try:
+        excel_report.build_historial_workbook(historial_path, historial.eventos_completos(environment))
+    except RuntimeError as exc:
+        logger.warning("No se genero el Excel de historial: %s", exc)
+        historial_path = None
+
+    matriz_data = matriz_ambientes.actualizar(environment, filas_actuales)
+
     print()
     print("=== Paso 6/7: comparando contra el catalogo (Orden_RE_Base.txt) ===")
     total_nuevos = None
@@ -226,7 +249,6 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     print("=== Paso 7/7: generando el Excel final ===")
     excel_path = report_root / "reporte_completo.xlsx"
     try:
-        from . import excel_report
         resumen = {
             "Ambiente": environment,
             "Fecha de la corrida": run_tag,
@@ -243,6 +265,8 @@ def cmd_run_all(args: argparse.Namespace) -> None:
             "Nuevos vs corrida anterior": len(historial_resumen["nuevos"]),
             "Cambiaron vs corrida anterior": len(historial_resumen["cambios"]),
             "Eliminados vs corrida anterior": len(historial_resumen["eliminados"]),
+            "Nombres repetidos en config-control": len(config_summary.nombres_repetidos),
+            "Items en R2 (no procesados en el reporte agrupado)": len(r2_rows),
         }
         excel_report.build_workbook(
             excel_path, resumen=resumen,
@@ -252,10 +276,16 @@ def cmd_run_all(args: argparse.Namespace) -> None:
             group_csv=group_out_csv,
             nuevos_csv=nuevos_r3_csv if total_nuevos is not None else None,
             historial_resumen=historial_resumen,
+            r2_rows=r2_rows,
+            nombres_repetidos=config_summary.nombres_repetidos,
         )
+
+        matriz_path = config.REPORTES_DIR / "matriz_ambientes.xlsx"
+        excel_report.build_matriz_workbook(matriz_path, matriz_data, environments=config.ENVIRONMENTS)
     except RuntimeError as exc:
         logger.warning("No se genero el Excel: %s", exc)
         excel_path = None
+        matriz_path = None
 
     if excel_path:
         # Ya todo quedo embebido en el Excel; no dejamos los CSV/TXT
@@ -283,10 +313,23 @@ def cmd_run_all(args: argparse.Namespace) -> None:
             f"{len(historial_resumen['cambios'])} cambios, "
             f"{len(historial_resumen['eliminados'])} eliminados"
         )
+    if config_summary.nombres_repetidos:
+        total_afectados = sum(len(v) for v in config_summary.nombres_repetidos.values())
+        print(
+            f"  Nombres repetidos:           {len(config_summary.nombres_repetidos)} grupos "
+            f"({total_afectados} archivos afectados, ver hoja 'Nombres Repetidos')"
+        )
     if excel_path:
         print()
         print(f"  Reporte para revisar: {excel_path}")
+    if matriz_path:
+        print(f"  Matriz de ambientes (acumulable): {matriz_path}")
+    if historial_path:
+        print(f"  Historial completo (acumulable): {historial_path}")
     print("=" * 60)
+
+    if excel_path and not getattr(args, "no_abrir", False):
+        _abrir_excel(excel_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -342,6 +385,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_validar.set_defaults(func=cmd_validar_nuevos)
 
     p_run_all = sub.add_parser("run-all", parents=[common_aws], help="Corre el pipeline completo (los 6 pasos).")
+    p_run_all.add_argument("--no-abrir", action="store_true", help="No abrir el Excel automaticamente al terminar.")
     p_run_all.set_defaults(func=cmd_run_all)
 
     p_eventos = sub.add_parser(
@@ -349,7 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="En events-manager (UDZ): identifica por flujo si tiene crudos, transmisiones o ambos.",
     )
     p_eventos.add_argument("--events-dir", required=True, help="Carpeta descargada de events-manager (crudos/ y resultados/).")
-    p_eventos.add_argument("--out-csv", required=True)
+    p_eventos.add_argument("--out-xlsx", required=True)
     p_eventos.set_defaults(func=cmd_identificar_eventos)
 
     sub.add_parser("menu", help="Menu interactivo (tambien se activa si no das ningun comando).")

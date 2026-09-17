@@ -41,15 +41,55 @@ def test_agrupa_una_fila_por_json_y_totaliza(tmp_path):
     assert total_subtipos == 2
 
     rows = list(csv.reader(out_csv.open(encoding="utf-8"), delimiter=";"))
+    header = rows[0]
+    idx_subtipo = header.index("Nombre del subtipo")
+    idx_cantidad = header.index("Cantidad de archivos con ese subtipo")
     data_rows = {r[0]: r for r in rows if r and r[0] not in ("Nombre de los JSONs", "TOTAL_R3", "")}
     # Solo la primera fila del grupo "carta" trae subtipo/cantidad.
-    assert data_rows["AAA.json"][2] == "carta"
-    assert data_rows["AAA.json"][3] == "2"
-    assert data_rows["BBB.json"][2] == ""
-    assert data_rows["BBB.json"][3] == ""
+    assert data_rows["AAA.json"][idx_subtipo] == "carta"
+    assert data_rows["AAA.json"][idx_cantidad] == "2"
+    assert data_rows["BBB.json"][idx_subtipo] == ""
+    assert data_rows["BBB.json"][idx_cantidad] == ""
 
     total_row = next(r for r in rows if r and r[0] == "TOTAL_R3")
-    assert total_row[3] == "3"
+    assert total_row[idx_cantidad] == "3"
+
+
+def test_grupo_queda_contiguo_aunque_alfabeticamente_no_lo_este(tmp_path):
+    # AAA_carta y ZZZ_carta son del mismo subtipo, pero MMM_otro cae
+    # alfabeticamente entre los dos. Ninguno esta en ORDEN_REPORTE_SUBTIPOS,
+    # asi que sin el fix de agrupar por grupo (no por archivo suelto) el
+    # orden final seria AAA_carta, MMM_otro, ZZZ_carta - el subtipo de
+    # ZZZ_carta quedaria oculto pegado a la fila de MMM_otro (subtipos
+    # "trocados" en el Excel).
+    r3_dir = tmp_path / "R3"
+    _write_json(r3_dir / "AAA_carta.json", {"workflow_variables": {"tipoDocumento": "carta"}, "s3_path": "s3://x/AAA"})
+    _write_json(r3_dir / "MMM_otro.json", {"workflow_variables": {"tipoDocumento": "otro"}, "s3_path": "s3://x/MMM"})
+    _write_json(r3_dir / "ZZZ_carta.json", {"workflow_variables": {"tipoDocumento": "carta"}, "s3_path": "s3://x/ZZZ"})
+
+    detalle_csv = tmp_path / "detalle.csv"
+    _write_detalle(detalle_csv, [
+        ["AAA_carta.json", "", "carta", "2", "", "s3://x/AAA"],
+        ["MMM_otro.json", "", "otro", "1", "", "s3://x/MMM"],
+        ["ZZZ_carta.json", "", "carta", "2", "", "s3://x/ZZZ"],
+    ])
+
+    out_csv = tmp_path / "out.csv"
+    group_report.generate(r3_dir, detalle_csv, out_csv)
+
+    all_rows = list(csv.reader(out_csv.open(encoding="utf-8"), delimiter=";"))
+    idx_subtipo = all_rows[0].index("Nombre del subtipo")
+    rows = [r for r in all_rows if r and r[0] not in ("Nombre de los JSONs", "TOTAL_R3")]
+    nombres_en_orden = [r[0] for r in rows]
+    # Las dos filas de "carta" deben quedar una al lado de la otra.
+    idx_aaa = nombres_en_orden.index("AAA_carta.json")
+    idx_zzz = nombres_en_orden.index("ZZZ_carta.json")
+    assert abs(idx_aaa - idx_zzz) == 1, f"carta no quedo contiguo: {nombres_en_orden}"
+
+    by_name = {r[0]: r for r in rows}
+    # La fila que muestra el subtipo debe realmente ser "carta", no "otro".
+    fila_con_subtipo = by_name["AAA_carta.json"] if by_name["AAA_carta.json"][idx_subtipo] else by_name["ZZZ_carta.json"]
+    assert fila_con_subtipo[idx_subtipo] == "carta"
 
 
 def test_columna_transmisiones_es_opcional(tmp_path):
@@ -67,10 +107,32 @@ def test_columna_transmisiones_es_opcional(tmp_path):
     group_report.generate(r3_dir, detalle_csv, out_csv, resultados_basenames={"AAA"})
 
     rows = list(csv.reader(out_csv.open(encoding="utf-8"), delimiter=";"))
-    assert rows[0][-1] == "Transmisiones"
+    idx_transm = rows[0].index("Transmisiones")
+    assert idx_transm != -1
     data_rows = {r[0]: r for r in rows if r and r[0] not in ("Nombre de los JSONs", "TOTAL_R3", "")}
-    assert data_rows["AAA.json"][-1] == "Si"
-    assert data_rows["BBB.json"][-1] == "No"
+    assert data_rows["AAA.json"][idx_transm] == "Si"
+    assert data_rows["BBB.json"][idx_transm] == "No"
+
+
+def test_columna_tipo_distingue_topics_de_ms(tmp_path):
+    r3_dir = tmp_path / "R3"
+    _write_json(r3_dir / "topics" / "AAA.json", {"workflow_variables": {"tipoDocumento": "carta"}, "s3_path": "s3://x/AAA"})
+    _write_json(r3_dir / "ms" / "BBB.json", {"workflow_variables": {"tipoDocumento": "otro"}, "s3_path": "s3://x/BBB"})
+
+    detalle_csv = tmp_path / "detalle.csv"
+    _write_detalle(detalle_csv, [
+        ["AAA.json", "", "carta", "1", "", "s3://x/AAA"],
+        ["BBB.json", "", "otro", "1", "", "s3://x/BBB"],
+    ])
+
+    out_csv = tmp_path / "out.csv"
+    group_report.generate(r3_dir, detalle_csv, out_csv)
+
+    rows = list(csv.reader(out_csv.open(encoding="utf-8"), delimiter=";"))
+    idx_tipo = rows[0].index("Tipo")
+    data_rows = {r[0]: r for r in rows if r and r[0] not in ("Nombre de los JSONs", "TOTAL_R3", "")}
+    assert data_rows["AAA.json"][idx_tipo] == "R3 - Topics"
+    assert data_rows["BBB.json"][idx_tipo] == "R3 - MS"
 
 
 def test_snapshot_rows_para_historial(tmp_path):

@@ -54,8 +54,10 @@ def _get_deserializer():
 
 def _build_client(session, max_attempts: int):
     from botocore.config import Config
+
+    from .aws_client import VERIFY_TLS
     boto_config = Config(retries={"max_attempts": max_attempts, "mode": "adaptive"})
-    return session.client("dynamodb", config=boto_config)
+    return session.client("dynamodb", config=boto_config, verify=VERIFY_TLS)
 
 
 def _deserialize_item(raw_item: dict, deserializer) -> dict:
@@ -77,6 +79,9 @@ class DownloadSummary:
     total_saved: int = 0
     total_existentes_referencia: int = 0
     counts_by_folder: Dict[str, int] = field(default_factory=dict)
+    # nombre_base -> lista de {"archivo", "s3_path"} de los items que
+    # terminaron compartiendo ese mismo nombre (solo grupos con 2+).
+    nombres_repetidos: Dict[str, list] = field(default_factory=dict)
 
 
 def _build_reference_keys(reference_dir: Optional[Path], field_name: str) -> set:
@@ -148,6 +153,11 @@ class _ScanState:
         self.total_existentes_referencia = 0
         self.total_seen = 0
         self.report_lines: list[str] = []
+        # Agrupa por el nombre "base" (antes de renombrar por colision).
+        # Al terminar el scan, cualquier grupo con mas de 1 elemento es un
+        # nombre repetido: varios items de Dynamo que terminan en el mismo
+        # s3_path, distinguidos solo por una carpeta intermedia distinta.
+        self.by_base_name: Dict[str, list] = {}
 
     def process_item(self, item: dict) -> None:
         with self.lock:
@@ -161,13 +171,17 @@ class _ScanState:
 
             output_dir = self.output_base_dir / flow_folder
             file_path = output_dir / f"{safe_name}.json"
+            s3_path = str(item.get("s3_path") or "")
 
             if self.used_names.get(safe_name):
-                s3_path = str(item.get("s3_path") or "")
                 if s3_path:
                     remainder = s3_path.removeprefix("s3://").split("/", 1)
                     suffix = remainder[1] if len(remainder) > 1 else remainder[0]
                     file_path = output_dir / f"{common.sanitize_filename(suffix)}.json"
+
+            self.by_base_name.setdefault(safe_name, []).append({
+                "archivo": file_path.name, "s3_path": s3_path,
+            })
 
             if not self.dry_run:
                 output_dir.mkdir(parents=True, exist_ok=True)
@@ -203,10 +217,14 @@ def _scan_segment_stream(client, table_name: str, segment: int, total_segments: 
 
 
 def _check_table_exists(client, table_name: str):
-    from botocore.exceptions import ClientError
+    from botocore.exceptions import ClientError, EndpointConnectionError
     try:
         table = client.describe_table(TableName=table_name)["Table"]
         return table.get("ItemCount", "N/D")
+    except EndpointConnectionError as exc:
+        raise TableNotFoundError(
+            f"No se pudo conectar a DynamoDB (¿estas en la red del banco?): {exc}"
+        ) from exc
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code == "ResourceNotFoundException":
@@ -254,6 +272,7 @@ def _write_manifest(
         "items_guardados": summary.total_saved,
         "items_ya_en_referencia": summary.total_existentes_referencia,
         "conteo_por_carpeta": summary.counts_by_folder,
+        "nombres_repetidos_detectados": len(summary.nombres_repetidos),
     }
     (output_base_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -312,12 +331,15 @@ def download(
             "\n".join(state.report_lines), encoding="utf-8"
         )
 
+    nombres_repetidos = {name: items for name, items in state.by_base_name.items() if len(items) > 1}
+
     summary = DownloadSummary(
         output_dir=output_base_dir,
         dry_run=dry_run,
         total_saved=state.total_saved,
         total_existentes_referencia=state.total_existentes_referencia,
         counts_by_folder=state.counts_by_folder,
+        nombres_repetidos=nombres_repetidos,
     )
 
     if not dry_run:
@@ -333,5 +355,11 @@ def download(
     )
     for folder, count in summary.counts_by_folder.items():
         logger.info("  %s: %s", folder, count)
+    if nombres_repetidos:
+        total_afectados = sum(len(items) for items in nombres_repetidos.values())
+        logger.warning(
+            "%s nombres repetidos detectados (%s archivos afectados en total) -> %s",
+            len(nombres_repetidos), total_afectados, output_base_dir / "nombres_repetidos.csv",
+        )
 
     return summary

@@ -5,14 +5,16 @@ cuales cambiaron (de subtipo, de configuracion TA, o de transmisiones).
 
 Se guarda por ambiente (qa/pdn/dev no se mezclan):
   historial/<ambiente>/estado_actual.json  -> snapshot mas reciente conocido
-  historial/<ambiente>/eventos.csv         -> log append-only de cada cambio
+  historial/<ambiente>/eventos.json        -> log append-only de cada cambio
+                                               (estado interno; el reporte
+                                               que se lee es el Excel que
+                                               genera export_excel())
 
 No requiere que el usuario haga nada: se actualiza solo cada vez que
 corre el pipeline completo.
 """
 from __future__ import annotations
 
-import csv
 import json
 import logging
 from datetime import datetime
@@ -32,7 +34,7 @@ def _estado_file(environment: str) -> Path:
 
 
 def _eventos_file(environment: str) -> Path:
-    return HISTORIAL_DIR / environment / "eventos.csv"
+    return HISTORIAL_DIR / environment / "eventos.json"
 
 
 def _load_estado(environment: str) -> Dict[str, dict]:
@@ -52,18 +54,25 @@ def _save_estado(environment: str, estado: Dict[str, dict]) -> None:
     path.write_text(json.dumps(estado, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _append_eventos(environment: str, eventos: List[dict]) -> None:
-    if not eventos:
-        return
+def _load_eventos(environment: str) -> List[dict]:
     path = _eventos_file(environment)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    escribir_encabezado = not path.exists()
-    with path.open("a", encoding="utf-8", newline="") as fh:
-        writer = csv.writer(fh, delimiter=";", lineterminator="\n")
-        if escribir_encabezado:
-            writer.writerow(["Fecha", "Flujo", "Tipo de cambio", "Detalle"])
-        for ev in eventos:
-            writer.writerow([ev["fecha"], ev["flujo"], ev["tipo"], ev["detalle"]])
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("No se pudo leer el log de eventos previo (%s); se parte de uno vacio.", exc)
+        return []
+
+
+def _append_eventos(environment: str, eventos: List[dict]) -> List[dict]:
+    completos = _load_eventos(environment)
+    completos.extend(eventos)
+    if eventos:
+        path = _eventos_file(environment)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(completos, ensure_ascii=False, indent=2), encoding="utf-8")
+    return completos
 
 
 def actualizar(environment: str, filas_actuales: List[dict], fecha: str = None) -> dict:
@@ -120,3 +129,9 @@ def actualizar(environment: str, filas_actuales: List[dict], fecha: str = None) 
         environment, len(nuevos), len(eliminados), len(cambios),
     )
     return resumen
+
+
+def eventos_completos(environment: str) -> List[dict]:
+    """El log acumulado completo (todas las corridas anteriores incluidas),
+    para exportarlo a Excel con excel_report.build_historial_workbook."""
+    return _load_eventos(environment)
